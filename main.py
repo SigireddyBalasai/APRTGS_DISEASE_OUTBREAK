@@ -63,7 +63,8 @@ class HawkesPointProcess:
     def intensity(self, t):
         if len(self.events) == 0:
             return self.mu
-        past_events = self.events[self.events < t]
+        events_arr = np.array(self.events)
+        past_events = events_arr[events_arr < t]
         if len(past_events) == 0:
             return self.mu
         time_gaps = t - past_events
@@ -86,7 +87,8 @@ class HawkesPointProcess:
 
     def predict_excess_risk(self, t, window_days=7):
         baseline_expected = self.mu * window_days
-        recent_events = self.events[self.events > (t - 1)]
+        events_arr = np.array(self.events)
+        recent_events = events_arr[events_arr > (t - 1)]
         if len(recent_events) == 0:
             excess_rate = 0
         else:
@@ -106,15 +108,15 @@ class HawkesPointProcess:
 
 
 print("\n[2] Hawkes Process Analysis...")
-dengue_data = df[df["disease_class"] == "Dengue"].copy()
-days_delta = (dengue_data["datetime"] - dengue_data["datetime"].min()).dt.days.values
+all_data = df.copy()
+days_delta = (all_data["datetime"] - all_data["datetime"].min()).dt.days.values
 hawkes = HawkesPointProcess(baseline_mu=0.3, alpha=0.25, beta=0.15)
 hawkes.add_events(days_delta)
 print(f"Baseline intensity (μ): {hawkes.mu:.4f} cases/day")
 print(f"Branching ratio (α): {hawkes.alpha:.4f}")
 print(f"Temporal decay (β): {hawkes.beta:.4f}")
 print(f"Log-likelihood: {hawkes.log_likelihood():.2f}")
-risk_pred = hawkes.predict_excess_risk(dengue_data["days"].max(), window_days=7)
+risk_pred = hawkes.predict_excess_risk(days_delta.max(), window_days=7)
 print("\nNext 7-day forecast:")
 print(f"  Baseline expected: {risk_pred['baseline_expected']:.2f}")
 print(f"  Excess expected: {risk_pred['excess_expected']:.2f}")
@@ -275,7 +277,7 @@ if len(clusters) > 0:
 
 # --- Anomaly Detection ---
 class AnomalyDetector:
-    def __init__(self, contamination : float = 0.05):
+    def __init__(self, contamination: float = 0.05):
         self.contamination = contamination
         self.model = IsolationForest(contamination=contamination, random_state=42)
         self.scaler = StandardScaler()
@@ -356,7 +358,9 @@ def build_alert_report(cluster_data, anomaly_data):
     alert_report = {
         "timestamp": datetime.now(),
         "n_clusters": len(cluster_data),
-        "n_anomalies": (anomaly_data["is_anomaly"].sum() if anomaly_data is not None else 0),
+        "n_anomalies": (
+            anomaly_data["is_anomaly"].sum() if anomaly_data is not None else 0
+        ),
         "top_clusters": [],
         "top_anomalies": [],
     }
