@@ -1,0 +1,67 @@
+diff --git a/main2.py b/main2.py
+index 7ae6cb2..fca4619 100644
+--- a/main2.py
++++ b/main2.py
+@@ -99,7 +99,7 @@ class SpatiotemporalHawkes(tf.keras.Model):
+             tf.expand_dims(lat1, 1), tf.expand_dims(lon1, 1),
+             tf.expand_dims(lat2, 0), tf.expand_dims(lon2, 0))
+ 
+-    def call(self, inputs, training=False):
++    def call(self, inputs, training=False, mask=None):
+         t_ev = tf.cast(tf.reshape(inputs["t_events"], [-1]), tf.float32)
+         lat_ev = tf.cast(tf.reshape(inputs["lat_events"], [-1]), tf.float32)
+         lon_ev = tf.cast(tf.reshape(inputs["lon_events"], [-1]), tf.float32)
+@@ -224,7 +224,7 @@ class SpatiotemporalHawkes(tf.keras.Model):
+         return cfg
+ 
+     @classmethod
+-    def from_config(cls, config):
++    def from_config(cls, config, custom_objects=None):
+         return cls(**config)
+ 
+ 
+@@ -302,9 +302,9 @@ def preprocess_disease_data(df):
+     t_ref = df["time"].min()
+     df["t_hours"] = (df["time"] - t_ref).dt.total_seconds() / 3600.0
+ 
+-    t_events = df["t_hours"].values.astype(np.float32)
+-    lat_events = df["latitude"].values.astype(np.float32)
+-    lon_events = df["longitude"].values.astype(np.float32)
++    t_events = df["t_hours"].values
++    lat_events = df["latitude"].values
++    lon_events = df["longitude"].values
+     T = float(t_events.max()) + 1.0
+ 
+     print(f"Number of events     : {len(t_events)}")
+@@ -514,15 +514,20 @@ class HotspotPredictor:
+ 
+         return lat_grid.numpy(), lon_grid.numpy(), risk_map
+ 
+-    def predict_temporal_evolution(self, pincode, hours_ahead=72,
+-                                  step_hours=1.0):
++    def predict_temporal_evolution(self, pincode, hours_ahead=72, step_hours=1.0):
+         df = self.data["df_sorted"]
+         t_events = self.data["t_events"]
+         lat_events = self.data["lat_events"]
+         lon_events = self.data["lon_events"]
+         t_ref = self.data["t_ref"]
+ 
+-        loc = df[df["pincode"] == pincode].iloc[0]
++        # Ensure pincode is string for comparison
++        pincode_str = str(pincode)
++        df_pincode = df[df["pincode"] == pincode_str]
++        if df_pincode.empty:
++            print(f"Warning: pincode {pincode} not found in data. Skipping.")
++            return pd.DataFrame()
++        loc = df_pincode.iloc[0]
+         lat = np.float32(loc["latitude"])
+         lon = np.float32(loc["longitude"])
+ 
+@@ -594,7 +599,6 @@ def main():
+     df["snomet_id"] = df["snomet_id"].astype(str)
+     # Optionally add gender and case_id for compatibility
+     if "gender" not in df.columns:
+-        import numpy as np
+         df["gender"] = np.random.choice(["M", "F"], size=len(df))
+     if "case_id" not in df.columns:
+         df["case_id"] = range(len(df))
