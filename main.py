@@ -1,8 +1,10 @@
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 
 # --- Load Data ---
 outbreak_df = pd.read_csv("data/outbreak_dummy.csv")
@@ -23,6 +25,9 @@ pincode_avg = pincode_avg.groupby("pincode", as_index=False)[
 merged = pd.merge(outbreak_df, pd.DataFrame(pincode_avg), on="pincode", how="left")
 print("Merged Outbreak Data with Lat/Long (Averaged):")
 print(merged)
+
+# --- Hawkes Keras Model Training ---
+from hawkes_keras_train import train_hawkes_model
 
 
 # --- Data Preparation ---
@@ -50,77 +55,75 @@ validate_data(df)
 
 
 # --- Hawkes Process ---
+
 class HawkesPointProcess:
-    def __init__(self, baseline_mu=0.5, alpha=0.3, beta=0.2):
+    def __init__(self, baseline_mu=0.5, alpha=0.3, beta=0.2, gamma=0.1):
         self.mu = baseline_mu
         self.alpha = alpha
-        self.beta = beta
-        self.events = []
+        self.beta = beta  # temporal decay
+        self.gamma = gamma  # spatial decay
+        self.events = []  # list of (t, lat, lon)
 
-    def add_events(self, timestamps):
-        self.events = list(np.sort(np.array(timestamps)).tolist())
-
-    def intensity(self, t):
-        if len(self.events) == 0:
-            return self.mu
-        events_arr = np.array(self.events)
-        past_events = events_arr[events_arr < t]
-        if len(past_events) == 0:
-            return self.mu
-        time_gaps = t - past_events
-        hawkes_term = self.alpha * np.sum(np.exp(-self.beta * time_gaps))
-        return self.mu + hawkes_term
-
-    def log_likelihood(self):
-        if len(self.events) == 0:
-            return 0
-        log_lik = 0
-        for t in self.events:
-            log_lik += np.log(self.intensity(t) + 1e-10)
-        t_max = self.events[-1]
-        time_grid = np.linspace(0, t_max, 1000)
-        dt = t_max / 1000
-        integral = 0
-        for t in time_grid:
-            integral += self.intensity(t) * dt
-        return log_lik - integral
-
-    def predict_excess_risk(self, t, window_days=7):
-        baseline_expected = self.mu * window_days
-        events_arr = np.array(self.events)
-        recent_events = events_arr[events_arr > (t - 1)]
-        if len(recent_events) == 0:
-            excess_rate = 0
-        else:
-            excess_rate = (
-                self.alpha
-                * len(recent_events)
-                * (1 - np.exp(-self.beta * window_days))
-                / self.beta
-            )
-        excess_cases = excess_rate * window_days
-        excess_risk = excess_cases / baseline_expected if baseline_expected > 0 else 0
-        return {
-            "baseline_expected": baseline_expected,
-            "excess_expected": excess_cases,
-            "relative_risk": 1 + excess_risk,
-        }
+    def add_events(self, event_tuples):
+        # event_tuples: list of (t, lat, lon)
+        self.events = sorted(event_tuples, key=lambda x: x[0])
 
 
-print("\n[2] Hawkes Process Analysis...")
+
+print("\n[2] Spatio-Temporal Hawkes Process Analysis...")
+
 all_data = df.copy()
 days_delta = (all_data["datetime"] - all_data["datetime"].min()).dt.days.values
-hawkes = HawkesPointProcess(baseline_mu=0.3, alpha=0.25, beta=0.15)
-hawkes.add_events(days_delta)
-print(f"Baseline intensity (μ): {hawkes.mu:.4f} cases/day")
-print(f"Branching ratio (α): {hawkes.alpha:.4f}")
-print(f"Temporal decay (β): {hawkes.beta:.4f}")
-print(f"Log-likelihood: {hawkes.log_likelihood():.2f}")
-risk_pred = hawkes.predict_excess_risk(days_delta.max(), window_days=7)
-print("\nNext 7-day forecast:")
+latitudes = all_data["latitude"].values
+longitudes = all_data["longitude"].values
+event_tuples = list(zip(days_delta, latitudes, longitudes))
+events_np = np.array(event_tuples, dtype=np.float32)
+
+# --- Use Keras-based fitting ---
+print("Fitting Hawkes process parameters (mu, alpha, beta, gamma) with Keras...")
+model, history = train_hawkes_model(events_np, epochs=100, val_split=0.2, lr=0.05)
+print("Estimated parameters (Keras):")
+print(model.get_config())
+
+# --- Ported risk prediction logic ---
+def keras_predict_excess_risk(model, t, lat, lon, events_np, window_days=7):
+    baseline_expected = float(model.mu.numpy()) * window_days
+    arr = events_np
+    recent_mask = arr[:, 0] > (t - 1)
+    recent_events = arr[recent_mask]
+    if len(recent_events) == 0:
+        excess_rate = 0
+    else:
+        # Use model's spatial_kernel
+        spatial_kernels = []
+        for ev in recent_events:
+            spatial_kernels.append(float(model.spatial_kernel(lat, lon, ev[1], ev[2]).numpy()))
+        spatial_kernels = np.array(spatial_kernels)
+        excess_rate = (
+            float(model.alpha.numpy())
+            * np.sum(spatial_kernels)
+            * (1 - np.exp(-float(model.beta.numpy()) * window_days))
+            / float(model.beta.numpy())
+        )
+    excess_cases = excess_rate * window_days
+    excess_risk = excess_cases / baseline_expected if baseline_expected > 0 else 0
+    return {
+        "baseline_expected": baseline_expected,
+        "excess_expected": excess_cases,
+        "relative_risk": 1 + excess_risk,
+    }
+
+# Use the most recent event's location for risk prediction
+last_t, last_lat, last_lon = events_np[-1]
+risk_pred = keras_predict_excess_risk(model, last_t, last_lat, last_lon, events_np, window_days=7)
+print("\nNext 7-day forecast (Keras):")
 print(f"  Baseline expected: {risk_pred['baseline_expected']:.2f}")
 print(f"  Excess expected: {risk_pred['excess_expected']:.2f}")
 print(f"  Relative risk: {risk_pred['relative_risk']:.2f}x")
+
+# (Optional) Use the most recent event's location for risk prediction (if you want to port this logic)
+# last_t, last_lat, last_lon = event_tuples[-1]
+# ...
 
 
 # --- Scan Statistic ---
