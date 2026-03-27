@@ -8,6 +8,7 @@ import pandas as pd
 # ===========================================================================
 
 class SpatiotemporalHawkes(tf.keras.Model):
+
     def __init__(
         self,
         mu_init=0.5,
@@ -18,6 +19,7 @@ class SpatiotemporalHawkes(tf.keras.Model):
         lon_bounds=None,
         time_grid_size=50,
         space_grid_size=10,
+        num_diseases=1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -29,6 +31,7 @@ class SpatiotemporalHawkes(tf.keras.Model):
         self._lon_bounds = lon_bounds
         self._time_grid_size = time_grid_size
         self._space_grid_size = space_grid_size
+        self._num_diseases = num_diseases
 
         self._log_mu = self.add_weight(
             name="log_mu", shape=(),
@@ -49,6 +52,13 @@ class SpatiotemporalHawkes(tf.keras.Model):
             name="log_gamma", shape=(),
             initializer=tf.keras.initializers.Constant(
                 self._inv_softplus(gamma_init)),
+            trainable=True)
+
+        # Cross-disease excitation matrix (num_diseases x num_diseases)
+        self.cross_alpha = self.add_weight(
+            name="cross_alpha",
+            shape=(self._num_diseases, self._num_diseases),
+            initializer=tf.keras.initializers.Constant(self._inv_softplus(alpha_init)),
             trainable=True)
 
     @staticmethod
@@ -103,21 +113,24 @@ class SpatiotemporalHawkes(tf.keras.Model):
         t_ev = tf.cast(tf.reshape(inputs["t_events"], [-1]), tf.float32)
         lat_ev = tf.cast(tf.reshape(inputs["lat_events"], [-1]), tf.float32)
         lon_ev = tf.cast(tf.reshape(inputs["lon_events"], [-1]), tf.float32)
+        disease_ev = tf.cast(tf.reshape(inputs["disease_events"], [-1]), tf.int32)
         T = tf.cast(tf.reshape(inputs["T"], []), tf.float32)
-        nll = self._neg_log_likelihood(t_ev, lat_ev, lon_ev, T)
+        nll = self._neg_log_likelihood(t_ev, lat_ev, lon_ev, disease_ev, T)
         return nll
 
-    def _neg_log_likelihood(self, t_events, lat_events, lon_events, T):
+    def _neg_log_likelihood(self, t_events, lat_events, lon_events, disease_events, T):
         mu = self.mu
-        alpha = self.alpha
         beta = self.beta
         gamma = self.gamma
         n = tf.shape(t_events)[0]
+        num_diseases = self._num_diseases
+        cross_alpha = tf.math.softplus(self.cross_alpha)  # shape [num_diseases, num_diseases]
 
         idx = tf.argsort(t_events)
         t_sort = tf.gather(t_events, idx)
         la_sort = tf.gather(lat_events, idx)
         lo_sort = tf.gather(lon_events, idx)
+        d_sort = tf.gather(disease_events, idx)
 
         # TERM 1
         dt_mat = tf.expand_dims(t_sort, 1) - tf.expand_dims(t_sort, 0)
@@ -128,11 +141,19 @@ class SpatiotemporalHawkes(tf.keras.Model):
         dist_mat = self._pairwise_haversine(
             la_sort, lo_sort, la_sort, lo_sort)
         spatial = tf.math.exp(-gamma * dist_mat)
-        trigger_at_events = tf.reduce_sum(temporal * spatial, axis=1)
-        lam_events = mu + alpha * trigger_at_events
+
+        # Cross-disease excitation: for each event i, sum over all j < i
+        # cross_alpha[d_i, d_j] * temporal[i, j] * spatial[i, j]
+        d_i = tf.expand_dims(d_sort, 1)  # shape [n, 1]
+        d_j = tf.expand_dims(d_sort, 0)  # shape [1, n]
+        d_i_b = tf.broadcast_to(d_i, [n, n])  # shape [n, n]
+        d_j_b = tf.broadcast_to(d_j, [n, n])  # shape [n, n]
+        cross = tf.gather_nd(cross_alpha, tf.stack([d_i_b, d_j_b], axis=-1))  # [n, n]
+        trigger_at_events = tf.reduce_sum(cross * temporal * spatial, axis=1)
+        lam_events = mu + trigger_at_events
         term1 = tf.reduce_sum(tf.math.log(tf.maximum(lam_events, 1e-10)))
 
-        # TERM 2
+        # TERM 2: Integral over space and time
         la_min, la_max, lo_min, lo_max = self._spatial_bounds(
             la_sort, lo_sort)
         m_t = self._time_grid_size
@@ -163,7 +184,7 @@ class SpatiotemporalHawkes(tf.keras.Model):
             dt_grid > 0.0, tf.float32)
 
         trigger_grid = tf.matmul(D, tf.transpose(S))
-        lam_grid = mu + alpha * trigger_grid
+        lam_grid = mu + tf.reduce_sum(trigger_grid, axis=1)
         integral = tf.reduce_sum(lam_grid) * dt_vol * dla_vol * dlo_vol
 
         return -(term1 - integral)
@@ -239,11 +260,11 @@ class HawkesTrainer:
             learning_rate=0.01)
         self.loss_history = []
 
-    def _train_step(self, t_ev, la_ev, lo_ev, T):
+    def _train_step(self, t_ev, la_ev, lo_ev, disease_ev, T):
         with tf.GradientTape() as tape:
             nll = self.model(
                 {"t_events": t_ev, "lat_events": la_ev,
-                 "lon_events": lo_ev, "T": T},
+                 "lon_events": lo_ev, "disease_events": disease_ev, "T": T},
                 training=True)
 
         trainable_vars = self.model.trainable_variables
@@ -263,16 +284,24 @@ class HawkesTrainer:
         self.optimizer.apply_gradients(valid_pairs)
         return nll
 
-    def fit(self, t_events, lat_events, lon_events, T,
+    def fit(self, t_events, lat_events, lon_events, disease_events, T,
             epochs=300, verbose=True):
         t_ev = tf.constant(t_events, dtype=tf.float32)
         la_ev = tf.constant(lat_events, dtype=tf.float32)
         lo_ev = tf.constant(lon_events, dtype=tf.float32)
+        disease_ev = tf.constant(disease_events, dtype=tf.int32)
         T_c = tf.constant(T, dtype=tf.float32)
 
         print(f"\n  Trainable variables: {len(self.model.trainable_variables)}")
         for v in self.model.trainable_variables:
-            print(f"    {v.name} = {float(v.numpy()):.4f}")
+            arr = v.numpy()
+            if arr.shape == ():
+                # Scalar
+                print(f"    {v.name} = {float(arr):.4f}")
+            else:
+                arr_flat = arr.flatten()
+                arr_preview = np.array2string(arr_flat, precision=4, separator=', ', threshold=5)
+                print(f"    {v.name}: shape={arr.shape}, values={arr_preview}")
         print()
 
         for epoch in range(epochs):
@@ -302,9 +331,14 @@ def preprocess_disease_data(df):
     t_ref = df["time"].min()
     df["t_hours"] = (df["time"] - t_ref).dt.total_seconds() / 3600.0
 
+    # Encode disease type as integer
+    disease_types, disease_type_indices = np.unique(df["snomet_id"], return_inverse=True)
+    df["disease_type"] = disease_type_indices
+
     t_events = df["t_hours"].values
     lat_events = df["latitude"].values
     lon_events = df["longitude"].values
+    disease_events = df["disease_type"].values.astype(np.int32)
     T = float(t_events.max()) + 1.0
 
     print(f"Number of events     : {len(t_events)}")
@@ -322,6 +356,8 @@ def preprocess_disease_data(df):
         "t_events": t_events,
         "lat_events": lat_events,
         "lon_events": lon_events,
+        "disease_events": disease_events,
+        "disease_types": disease_types,
         "T": T,
         "t_ref": t_ref,
         "df_sorted": df,
@@ -572,6 +608,7 @@ class HotspotPredictor:
 
 def main():
 
+
     # --- Load Data ---
     outbreak_df = pd.read_csv("data/outbreak_dummy.csv")
     pincode_df = pd.read_csv("data/pincode.csv")
@@ -580,15 +617,21 @@ def main():
 
     # Average lat/long for each pincode (ignoring NA)
     pincode_avg = pincode_df.copy()
+    pincode_avg["latitude"] = pd.to_numeric(pincode_avg["latitude"], errors="coerce")
+    pincode_avg["longitude"] = pd.to_numeric(pincode_avg["longitude"], errors="coerce")
     pincode_avg = pincode_avg[
         pincode_avg["latitude"].notna() & pincode_avg["longitude"].notna()
     ]
-    pincode_avg["latitude"] = pd.to_numeric(pincode_avg["latitude"], errors="coerce")
-    pincode_avg["longitude"] = pd.to_numeric(pincode_avg["longitude"], errors="coerce")
-    pincode_avg = pincode_avg.groupby("pincode", as_index=False)[
-        ["latitude", "longitude"]
-    ].mean()
+    pincode_avg = pincode_avg.groupby("pincode", as_index=False)[["latitude", "longitude"]].mean()
     merged = pd.merge(outbreak_df, pd.DataFrame(pincode_avg), on="pincode", how="left")
+
+    # Remove rows with missing latitude/longitude after merge
+    before_drop = len(merged)
+    merged = merged.dropna(subset=["latitude", "longitude", "time"])
+    after_drop = len(merged)
+    if after_drop < before_drop:
+        print(f"Dropped {before_drop - after_drop} rows with missing lat/lon/time after merge.")
+
     print("Merged Outbreak Data with Lat/Long (Averaged):")
     print(merged.head(10))
 
@@ -642,6 +685,7 @@ def main():
         lon_bounds=(lon_min, lon_max),
         time_grid_size=40,
         space_grid_size=8,
+        num_diseases=len(data_dict["disease_types"]),
     )
 
     # Dry run
@@ -649,6 +693,7 @@ def main():
         "t_events": tf.constant(data_dict["t_events"]),
         "lat_events": tf.constant(data_dict["lat_events"]),
         "lon_events": tf.constant(data_dict["lon_events"]),
+        "disease_events": tf.constant(data_dict["disease_events"]),
         "T": tf.constant(data_dict["T"]),
     }, training=False)
     print(f"\n  Initial NLL: {float(dummy_nll.numpy()):.2f}")
@@ -672,6 +717,7 @@ def main():
         data_dict["t_events"],
         data_dict["lat_events"],
         data_dict["lon_events"],
+        data_dict["disease_events"],
         T=data_dict["T"],
         epochs=500,
         verbose=True,
